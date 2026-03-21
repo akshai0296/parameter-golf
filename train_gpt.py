@@ -51,6 +51,8 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     final_eval_seq_len = int(os.environ.get("FINAL_EVAL_SEQ_LEN", 1024))
     final_eval_stride = int(os.environ.get("FINAL_EVAL_STRIDE", 0))
+    best_checkpoint = bool(int(os.environ.get("BEST_CHECKPOINT", "1")))
+    best_checkpoint_path = os.environ.get("BEST_CHECKPOINT_PATH", "best_model.pt")
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -1147,6 +1149,10 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    best_val_bpb = float("inf")
+    best_val_loss = float("inf")
+    best_step = -1
+    best_train_time_ms = 0.0
 
     step = 0
     while True:
@@ -1172,6 +1178,25 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if args.best_checkpoint and val_bpb < best_val_bpb:
+                best_val_bpb = float(val_bpb)
+                best_val_loss = float(val_loss)
+                best_step = int(step)
+                best_train_time_ms = float(training_time_ms)
+                if master_process:
+                    best_obj = {
+                        "model": {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()},
+                        "step": best_step,
+                        "val_loss": best_val_loss,
+                        "val_bpb": best_val_bpb,
+                        "train_time_ms": best_train_time_ms,
+                    }
+                    torch.save(best_obj, args.best_checkpoint_path)
+                    log0(
+                        f"best_checkpoint_saved step:{best_step} "
+                        f"val_loss:{best_val_loss:.4f} val_bpb:{best_val_bpb:.4f} "
+                        f"path:{args.best_checkpoint_path}"
+                    )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1244,6 +1269,22 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    if args.best_checkpoint:
+        if distributed:
+            dist.barrier()
+        if os.path.exists(args.best_checkpoint_path):
+            best_obj = torch.load(args.best_checkpoint_path, map_location="cpu")
+            base_model.load_state_dict(best_obj["model"], strict=True)
+            log0(
+                f"loaded_best_checkpoint step:{best_obj['step']} "
+                f"val_loss:{best_obj['val_loss']:.4f} val_bpb:{best_obj['val_bpb']:.4f} "
+                f"train_time:{best_obj['train_time_ms']:.0f}ms"
+            )
+        else:
+            log0(f"best_checkpoint_missing path:{args.best_checkpoint_path}")
+        if distributed:
+            dist.barrier()
+    
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
